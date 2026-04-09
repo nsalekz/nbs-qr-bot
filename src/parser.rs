@@ -15,6 +15,7 @@ pub fn parse_payment(text: &str) -> Result<PaymentInfo, String> {
     let amount = extract_amount(text)?;
     let name = extract_name(text, &account);
     let purpose = extract_purpose(text);
+    let reference = extract_reference(text);
 
     Ok(PaymentInfo {
         account,
@@ -22,7 +23,7 @@ pub fn parse_payment(text: &str) -> Result<PaymentInfo, String> {
         amount,
         purpose,
         code: "289".to_string(),
-        reference: None,
+        reference,
     })
 }
 
@@ -51,49 +52,112 @@ fn extract_account(text: &str) -> Result<String, String> {
 }
 
 /// Extract amount from text.
-/// Handles: "1.300 din", "1300 RSD", "iznos 1.300,00", "1,300.00 dinara", etc.
+/// Handles both comma-decimal ("3.307,78") and dot-decimal ("3307.78") formats.
 fn extract_amount(text: &str) -> Result<String, String> {
-    let lower = text.to_lowercase();
+    // Collect all candidate amounts with their context, pick the best one
+    let mut candidates: Vec<(String, usize)> = Vec::new(); // (normalized_amount, priority)
 
-    // Try patterns from most specific to least
-    let patterns: &[&str] = &[
-        // "1.300,50 din/rsd/dinara" or "1.300 din"
-        r"(\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?)\s*(?:din(?:ara)?|rsd)",
-        // "iznos/uplat/cena/cen...  1.300,50" or "iznos: 1300"
-        r"(?:iznos|uplat|cena|ukupno|svega|za\s+uplatu)[:\s]+(\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?)",
-        // Standalone amount with RSD prefix: "RSD 1300" or "RSD1.300,50"
-        r"RSD\s*(\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?)",
-        // Just a number near "din" or currency context (looser)
-        r"(\d+(?:,\d{1,2})?)\s*(?:din(?:ara)?|rsd)",
-    ];
+    // Pattern 1: keyword context (highest priority)
+    // "iznosu od 3307.78", "iznos: 1300", "za uplatu 1.300 din"
+    let kw_re = Regex::new(r"(?i)(?:iznos\w*|uplat\w*|cen\w*|ukupno|svega|za\s+uplatu)\s+(?:od\s+|[:\s])*(\d[\d.,]*)(?:\s*(?:din\w*|rsd))").unwrap();
+    if let Some(caps) = kw_re.captures(text) {
+        candidates.push((normalize_amount(&caps[1]), 0));
+    }
 
-    for pat in patterns {
-        let re = Regex::new(&format!("(?i){}", pat)).unwrap();
-        if let Some(caps) = re.captures(&lower) {
-            let raw = caps[1].to_string();
-            return Ok(normalize_amount(&raw));
+    // Pattern 2: number directly followed by currency ("3307.78 RSD", "1.300 din")
+    let currency_re = Regex::new(r"(?i)(\d[\d.,]*)\s*(?:din(?:ara)?|rsd)\b").unwrap();
+    for caps in currency_re.captures_iter(text) {
+        let raw = caps[1].to_string();
+        // Skip if it looks like a phone number or account-adjacent
+        if raw.len() > 1 {
+            candidates.push((normalize_amount(&raw), 1));
         }
     }
 
-    // Fallback: look for the text around "iznos" more broadly
-    let re_broad = Regex::new(r"(?i)(\d[\d\.,]*\d)\s*(?:din|rsd)").unwrap();
-    if let Some(caps) = re_broad.captures(text) {
-        return Ok(normalize_amount(&caps[1].to_string()));
+    // Pattern 3: "RSD 3307.78" prefix style
+    let prefix_re = Regex::new(r"(?i)RSD\s*(\d[\d.,]*)").unwrap();
+    if let Some(caps) = prefix_re.captures(text) {
+        candidates.push((normalize_amount(&caps[1]), 1));
+    }
+
+    // Among same-priority candidates, prefer the largest amount (avoids partial matches)
+    candidates.sort_by(|a, b| {
+        a.1.cmp(&b.1).then_with(|| {
+            let val_a = amount_value(&a.0);
+            let val_b = amount_value(&b.0);
+            val_b.partial_cmp(&val_a).unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+
+    if let Some((amount, _)) = candidates.into_iter().next() {
+        return Ok(amount);
     }
 
     Err("Nije pronadjen iznos. Ocekujem npr: '1.300 din' ili 'iznos 1300 RSD'".to_string())
 }
 
-/// Normalize amount string to NBS format: no dots, comma as decimal, trailing comma if needed.
-/// "1.300" -> "1300,"  |  "1.300,50" -> "1300,50"  |  "1300" -> "1300,"
+/// Parse a normalized amount string to a float for comparison
+fn amount_value(s: &str) -> f64 {
+    let clean = s.trim_end_matches(',').replace(',', ".");
+    clean.parse::<f64>().unwrap_or(0.0)
+}
+
+/// Normalize amount string to NBS format.
+/// Handles both dot-decimal ("3307.78") and comma-decimal ("3.307,78") inputs.
+/// Output always uses comma as decimal separator per NBS spec.
 fn normalize_amount(raw: &str) -> String {
-    // Remove thousand-separator dots
-    let s = raw.replace('.', "");
-    // Ensure there's a comma
+    let s = raw.trim();
+
+    // Determine if dot is decimal or thousand separator:
+    // - "3307.78" -> dot is decimal (1-2 digits after last dot, no comma present)
+    // - "1.300" -> dot is thousand sep (exactly 3 digits after dot)
+    // - "1.300,50" -> dot is thousand sep, comma is decimal
+
     if s.contains(',') {
-        s
+        // Comma present -> dots are thousand separators, comma is decimal
+        let no_thousands = s.replace('.', "");
+        return ensure_comma(&no_thousands);
+    }
+
+    if let Some(dot_pos) = s.rfind('.') {
+        let after_dot = &s[dot_pos + 1..];
+        if after_dot.len() <= 2 {
+            // Dot is decimal separator (e.g. "3307.78")
+            // Convert dot to comma
+            let converted = format!("{},{}", &s[..dot_pos], after_dot);
+            return converted;
+        } else {
+            // Dot is thousand separator (e.g. "1.300" -> 3 digits after dot)
+            let no_thousands = s.replace('.', "");
+            return ensure_comma(&no_thousands);
+        }
+    }
+
+    // No dot, no comma — whole number
+    ensure_comma(s)
+}
+
+fn ensure_comma(s: &str) -> String {
+    if s.contains(',') {
+        s.to_string()
     } else {
         format!("{},", s)
+    }
+}
+
+/// Extract reference number (model + poziv na broj)
+fn extract_reference(text: &str) -> Option<String> {
+    // Pattern: "model 97" ... "poziv na broj 60600272972371"
+    let model_re = Regex::new(r"(?i)model\s+(\d{2})").unwrap();
+    let poziv_re = Regex::new(r"(?i)poziv\s+na\s+broj\s+(\d+)").unwrap();
+
+    let model = model_re.captures(text).map(|c| c[1].to_string());
+    let poziv = poziv_re.captures(text).map(|c| c[1].to_string());
+
+    match (model, poziv) {
+        (Some(m), Some(p)) => Some(format!("{}{}", m, p)),
+        (None, Some(p)) => Some(format!("00{}", p)),
+        _ => None,
     }
 }
 
@@ -175,18 +239,24 @@ fn extract_name(text: &str, _account_raw: &str) -> String {
     "Primalac".to_string()
 }
 
-/// Extract address (street + city) from raw text, even single-line
+/// Extract address (street + city) from raw text, line by line to avoid cross-line greediness
 fn extract_address_from_text(text: &str) -> Option<String> {
-    // Look for "Street Name Number, Zip City" or "Street Name Number, City"
-    let re = Regex::new(
-        r"(?i)([\w\s]+\s+\d+)\s*[,.]?\s*(\d{5}\s+\w+)"
-    ).unwrap();
-    if let Some(caps) = re.captures(text) {
-        let street = caps[1].trim();
-        let city = caps[2].trim();
-        // Filter out false positives (phone numbers, amounts)
-        if !street.contains('+') && street.len() > 5 && street.len() < 40 {
-            return Some(format!("{}\r\n{}", street, city));
+    let lines: Vec<&str> = text.lines().map(|l| l.trim()).collect();
+    // Match street: "Name Name Number" on a single line, must start with a letter
+    let street_re = Regex::new(r"(?i)^([A-Za-z\u{0100}-\u{024F}][\w ]+\s+\d+)\s*[,.]?\s*$").unwrap();
+    let city_re = Regex::new(r"(?i)^\s*(\d{5}\s+\w+)").unwrap();
+
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(caps) = street_re.captures(line) {
+            let street = caps[1].trim();
+            if street.len() > 5 && street.len() < 40 {
+                if i + 1 < lines.len() {
+                    if let Some(city_caps) = city_re.captures(lines[i + 1]) {
+                        return Some(format!("{}\r\n{}", street, city_caps[1].trim()));
+                    }
+                }
+                return Some(street.to_string());
+            }
         }
     }
     None
@@ -213,14 +283,39 @@ fn looks_like_name(s: &str) -> bool {
 }
 
 fn find_address(lines: &[&str]) -> Option<String> {
-    let addr_re = Regex::new(r"(?i)\d{5}\s+\w+|(?:ulica|br\.?|bb)\s|(?:beograd|novi sad|nis|cacak|kragujevac|subotica|kraljevo|zrenjanin|pancevo|leskovac|valjevo|uzice)").unwrap();
-    let street_re = Regex::new(r"(?i)^\s*[\w\s]+(?: \d+| bb)").unwrap();
-    for line in lines {
-        if addr_re.is_match(line) || street_re.is_match(line) {
-            let l = line.trim().trim_end_matches(',').trim_end_matches('.');
-            if l.len() > 3 && l.len() < 50 && !l.to_lowercase().contains("telefon") {
-                return Some(l.to_string());
+    let city_re = Regex::new(r"(?i)^\s*\d{5}\s+\w+").unwrap();
+    let street_re = Regex::new(r"(?i)^[A-Za-z\u{0100}-\u{024F}][\w ]+\s+\d+\s*[,.]?\s*$").unwrap();
+    let known_city = Regex::new(r"(?i)\b(?:beograd|novi sad|nis|cacak|kragujevac|subotica|kraljevo|zrenjanin|pancevo|leskovac|valjevo|uzice)\b").unwrap();
+
+    // First pass: find street line
+    for (i, line) in lines.iter().enumerate() {
+        if street_re.is_match(line) {
+            let street = line.trim().trim_end_matches(',').trim_end_matches('.');
+            if street.len() > 5 && street.len() < 45
+                && !street.to_lowercase().contains("telefon")
+                && !street.to_lowercase().contains("pib")
+                && !street.to_lowercase().contains("mb:")
+            {
+                // Check next line for city
+                if i + 1 < lines.len() {
+                    let next = lines[i + 1].trim().trim_end_matches(',').trim_end_matches('.');
+                    if city_re.is_match(next) || known_city.is_match(next) {
+                        return Some(format!("{}\r\n{}", street, next));
+                    }
+                }
+                return Some(street.to_string());
             }
+        }
+    }
+
+    // Second pass: just find a city line
+    for line in lines {
+        let l = line.trim().trim_end_matches(',').trim_end_matches('.');
+        if (city_re.is_match(l) || known_city.is_match(l))
+            && l.len() > 3 && l.len() < 50
+            && !l.to_lowercase().contains("telefon")
+        {
+            return Some(l.to_string());
         }
     }
     None
@@ -315,6 +410,17 @@ Iznos za uplatu 1.300 din"#;
     }
 
     #[test]
+    fn test_cartel_shop_no_pib_in_name() {
+        let text = "Postovani,\nPrilikom porucivanja odabrali ste opciju \"direktna bankovna transakcija\".\n160-445519-82\nCartel Shop,\nMB: 63587001\nPIB: 108630307\nMilosa Obilica 2,\n32000 Cacak.\nkontakt telefon +381695500557.\nIznos za uplatu 1.300 din";
+        let info = parse_payment(text).unwrap();
+        assert!(!info.name.contains("108630307"), "PIB leaked into name: {}", info.name);
+        assert!(info.name.contains("Cartel Shop"), "Name missing: {}", info.name);
+        // Max 3 lines
+        let line_count = info.name.split("\r\n").count();
+        assert!(line_count <= 3, "Name has {} lines: {}", line_count, info.name);
+    }
+
+    #[test]
     fn test_account_padding() {
         assert_eq!(
             extract_account("racun: 160-445519-82").unwrap(),
@@ -323,7 +429,21 @@ Iznos za uplatu 1.300 din"#;
     }
 
     #[test]
-    fn test_amount_with_decimals() {
+    fn test_a1_invoice() {
+        let text = "Sutra istice rok za placanje racuna 03/2026. Ako jos niste izmirili svoj racun, dug u iznosu od 3307.78 RSD mozete da uplatite\nna tekuci racun 265-1110312345678-24\nmodel 97\npoziv na broj 60600272972371.\nU svakom trenutku racun mozete da platite online. Vas A1";
+        let info = parse_payment(text).unwrap();
+        assert_eq!(info.account, "265111031234567824");
+        assert_eq!(info.amount, "3307,78", "Amount was: {}", info.amount);
+        assert_eq!(info.reference, Some("9760600272972371".to_string()));
+    }
+
+    #[test]
+    fn test_amount_dot_decimal() {
+        assert_eq!(normalize_amount("3307.78"), "3307,78");
+    }
+
+    #[test]
+    fn test_amount_comma_decimal() {
         assert_eq!(normalize_amount("1.300,50"), "1300,50");
     }
 
@@ -333,7 +453,7 @@ Iznos za uplatu 1.300 din"#;
     }
 
     #[test]
-    fn test_amount_thousands() {
+    fn test_amount_thousands_only() {
         assert_eq!(normalize_amount("15.000"), "15000,");
     }
 }
