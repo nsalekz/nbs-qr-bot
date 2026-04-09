@@ -1,0 +1,30 @@
+[
+  {
+    "id": 1,
+    "category": "core",
+    "description": "Parse raw text dumps to extract account number, amount, payee name, purpose",
+    "steps": ["Regex extract account (hyphenated/flat)", "Regex extract amount (din/RSD/iznos)", "Extract payee name from context", "Infer payment purpose"],
+    "passes": true
+  },
+  {
+    "id": 2,
+    "category": "core",
+    "description": "Generate NBS IPS QR code image from parsed payment data",
+    "steps": ["Build IPS payload string", "Generate QR code", "Save as PNG"],
+    "passes": true
+  },
+  {
+    "id": 3,
+    "category": "core",
+    "description": "Telegram bot interface - receive text, reply with QR image",
+    "steps": ["Connect to Telegram API", "Handle /start command", "Parse incoming messages", "Send QR photo with caption"],
+    "passes": true
+  },
+  {
+    "id": 4,
+    "category": "core",
+    "description": "CLI interface - gen subcommand for local QR generation",
+    "steps": ["Accept text argument", "Parse and generate", "Save to file"],
+    "passes": true
+  }
+]

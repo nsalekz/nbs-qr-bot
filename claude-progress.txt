@@ -1,0 +1,20 @@
+NBS IPS QR Code Generator + Telegram Bot
+==========================================
+Status: Working / Complete
+Last updated: 09/04/26
+
+Rust CLI + Telegram bot that generates NBS IPS QR codes for Serbian bank payments.
+Parses raw invoice/payment text dumps and auto-extracts account, amount, payee name.
+
+Telegram bot: @QR_NBS_bot
+
+Usage:
+  CLI:  nbs-qr-bot gen "paste invoice text here" -o output.png
+  Bot:  nbs-qr-bot bot --token <TELEGRAM_BOT_TOKEN>
+        or set TELOXIDE_TOKEN env var
+
+Key spec details:
+- Amount (tag I) MUST have trailing comma even for whole numbers (e.g. RSD1300,)
+- Newlines in N/P fields must be real CR+LF (0x0D 0x0A)
+- Payment purpose (tag S) max 35 chars
+- Account numbers are 18 digits, no hyphens

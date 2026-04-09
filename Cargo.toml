@@ -1,0 +1,12 @@
+[package]
+name = "nbs-qr-bot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.6.0", features = ["derive", "env"] }
+image = "0.25.10"
+qrcode = "0.14.1"
+regex = "1.12.3"
+teloxide = { version = "0.17.0", features = ["macros"] }
+tokio = { version = "1.51.1", features = ["full"] }
